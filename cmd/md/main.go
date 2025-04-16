@@ -139,10 +139,7 @@ func advertise(params []string) {
 		log.Fatal(err)
 	}
 	for _, s := range ss {
-		// TODO: This should maybe allow advertising for different addresses
-		// than the local host's.
-		port := s.AddrPort.Port()
-		if err := registry.AdvertiseService(port, s.Name, s.Labels); err != nil {
+		if err := registry.AdvertiseRemoteService(s.AddrPort, s.Name, s.Labels); err != nil {
 			log.Fatal(err)
 		}
 	}

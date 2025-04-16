@@ -125,7 +125,7 @@ func serviceMatches(s Service, name string, labels map[string]string) bool {
 type Registry struct {
 	http.Handler
 
-	mutex         sync.Mutex
+	mutex sync.Mutex
 	// The local Tailnet IPv4 address of the local host. We set this at init
 	// time to be robust against host's admin switching to a different Tailnet.
 	localAddr     netip.Addr
@@ -150,11 +150,26 @@ func StartRegistry() (*Registry, error) {
 
 // AdvertiseService adds a local service to the list this registry advertises.
 func (r *Registry) AdvertiseService(port uint16, name string, labels map[string]string) error {
+	ap := netip.AddrPortFrom(r.localAddr, port)
+	return r.AdvertiseRemoteService(ap, name, labels)
+}
+
+// AdvertiseRemoteService adds a remote service to the list this registry
+// advertises. You should only do this to include services that aren't minidisc
+// enabled themselves.
+func (r *Registry) AdvertiseRemoteService(
+	addrPort netip.AddrPort, name string, labels map[string]string,
+) error {
+	if prefix, err := addrPort.Addr().Prefix(8); err != nil {
+		panic(err) // Only happens on bad params
+	} else if prefix != netip.MustParsePrefix("100.0.0.0/8") {
+		return fmt.Errorf("Non-tailscale address %s", addrPort.String())
+	}
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 	for _, ls := range r.localServices {
-		if port == ls.AddrPort.Port() {
-			return fmt.Errorf("Port %d already registered", port)
+		if addrPort == ls.AddrPort {
+			return fmt.Errorf("Address %s already registered", addrPort.String())
 		}
 	}
 	if labels == nil {
@@ -163,7 +178,7 @@ func (r *Registry) AdvertiseService(port uint16, name string, labels map[string]
 	r.localServices = append(r.localServices, Service{
 		Name:     name,
 		Labels:   labels,
-		AddrPort: netip.AddrPortFrom(r.localAddr, port),
+		AddrPort: addrPort,
 	})
 	return nil
 }
