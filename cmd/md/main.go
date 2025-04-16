@@ -1,16 +1,18 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
+	"net/netip"
 	"os"
 	"os/signal"
 	"slices"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 
 	"github.com/mscheidegger/minidisc/pkg/minidisc"
+	"gopkg.in/yaml.v3"
 )
 
 const usage = `Usage: md <command> [parameters]
@@ -18,9 +20,19 @@ const usage = `Usage: md <command> [parameters]
 Available commands:
   list - Print a list of advertised services on the Tailnet.
   find <name> [key=val] ...  - Find a service, given name and labels.
-  advertise <json file> - Read service config from JSON and advertise it.
+  advertise <cfgfile> - Read service config from YAML and advertise it.
   help - This page.
 `
+
+type Config struct {
+	Services []Service `yaml:"services"`
+}
+
+type Service struct {
+	Name    string            `yaml:"name"`
+	Address string            `yaml:"address"`
+	Labels  map[string]string `yaml:"labels"`
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -121,15 +133,9 @@ func advertise(params []string) {
 		path = "/dev/stdin"
 	}
 
-	// Read services from config file.
-	data, err := os.ReadFile(path)
+	cfg, err := readConfig(path)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Can't read '%s': %v\n", path, err)
-		os.Exit(2)
-	}
-	var ss []minidisc.Service
-	if err := json.Unmarshal(data, &ss); err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing config file: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error reading config file: %v\n", err)
 		os.Exit(2)
 	}
 
@@ -138,9 +144,20 @@ func advertise(params []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	for _, s := range ss {
-		if err := registry.AdvertiseRemoteService(s.AddrPort, s.Name, s.Labels); err != nil {
-			log.Fatal(err)
+	for _, s := range cfg.Services {
+		if strings.HasPrefix(s.Address, ":") {
+			port := parsePort(s.Address)
+			if err := registry.AdvertiseService(port, s.Name, s.Labels); err != nil {
+				log.Fatal(err)
+			}
+		} else {
+			ap, err := netip.ParseAddrPort(s.Address)
+			if err != nil {
+				log.Fatalf("Bad address '%s'", s.Address)
+			}
+			if err := registry.AdvertiseRemoteService(ap, s.Name, s.Labels); err != nil {
+				log.Fatal(err)
+			}
 		}
 	}
 
@@ -149,4 +166,25 @@ func advertise(params []string) {
 	quit := make(chan os.Signal)
 	signal.Notify(quit, os.Interrupt)
 	<-quit
+}
+
+func readConfig(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	cfg := &Config{}
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+func parsePort(addr string) uint16 {
+	addr = addr[1:len(addr)] // Remove leading :
+	port, err := strconv.ParseUint(addr, 10, 16)
+	if err != nil {
+		log.Fatalf("Bad address '%s'", addr)
+	}
+	return uint16(port)
 }

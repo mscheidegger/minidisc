@@ -1,0 +1,8 @@
+services:
+  - name: foobar
+    address: 100.1.2.3:42
+    labels:
+      gugus: dada
+      bla: blub
+  - name: frobotnik
+    address: :4711

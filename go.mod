@@ -28,4 +28,5 @@ require (
 	golang.org/x/sys v0.29.1-0.20250107080300-1c14dcadc3ab // indirect
 	golang.org/x/text v0.21.0 // indirect
 	golang.zx2c4.com/wireguard/windows v0.5.3 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
