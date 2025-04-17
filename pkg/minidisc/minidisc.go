@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"tailscale.com/client/tailscale"
+	"tailscale.com/ipn/ipnstate"
 )
 
 // Service represents a network service on the Tailnet.
@@ -151,7 +152,7 @@ func StartRegistry() (*Registry, error) {
 // AdvertiseService adds a local service to the list this registry advertises.
 func (r *Registry) AdvertiseService(port uint16, name string, labels map[string]string) error {
 	ap := netip.AddrPortFrom(r.localAddr, port)
-	return r.AdvertiseRemoteService(ap, name, labels)
+	return r.addService(ap, name, labels)
 }
 
 // AdvertiseRemoteService adds a remote service to the list this registry
@@ -165,6 +166,13 @@ func (r *Registry) AdvertiseRemoteService(
 	} else if prefix != netip.MustParsePrefix("100.0.0.0/8") {
 		return fmt.Errorf("Non-tailscale address %s", addrPort.String())
 	}
+	return r.addService(addrPort, name, labels)
+}
+
+// addService implements the common parts of AdvertiseService and AdvertiseRemoteService.
+func (r *Registry) addService(
+	addrPort netip.AddrPort, name string, labels map[string]string,
+) error {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 	for _, ls := range r.localServices {
@@ -214,7 +222,6 @@ func (r *Registry) ServeHTTP(wrt http.ResponseWriter, req *http.Request) {
 
 // handleGetServices handles "GET /services".
 func (r *Registry) handleGetServices(wrt http.ResponseWriter, req *http.Request) {
-	log.Print("GET /services")
 	if req.Method != "GET" {
 		wrt.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -270,7 +277,7 @@ func (r *Registry) handlePostAddDelegate(wrt http.ResponseWriter, req *http.Requ
 		wrt.WriteHeader(http.StatusBadRequest)
 	}
 	if adr.AddrPort.Addr() != r.localAddr {
-		log.Print("add-delegate request for non-local address %s", adr.AddrPort.String())
+		log.Printf("add-delegate request for non-local address %s\n", adr.AddrPort.String())
 		wrt.WriteHeader(http.StatusForbidden)
 		return
 	}
@@ -300,7 +307,6 @@ func (r *Registry) removeDelegate(d netip.AddrPort) {
 }
 
 func (r *Registry) handleGetPing(wrt http.ResponseWriter, req *http.Request) {
-	log.Print("/ping")
 	wrt.WriteHeader(http.StatusOK)
 }
 
@@ -367,7 +373,7 @@ func (r *Registry) runDelegateNode(listener net.Listener) {
 	mime := "application/json"
 	resp, err := http.Post(url, mime, bytes.NewReader(data))
 	if err != nil || resp.StatusCode != 200 {
-		log.Fatal("Cannot register with leader. Status %d, error %v", resp.StatusCode)
+		log.Fatalf("Cannot register with leader. Status %d, error %v", resp.StatusCode, err)
 	}
 
 	// Serve, but regularly check whether the leader has died.
@@ -377,7 +383,6 @@ func (r *Registry) runDelegateNode(listener net.Listener) {
 			log.Printf("minidisc delegate server exited: %v", err)
 			return
 		case <-time.After(5 * time.Second):
-			log.Print("Delegate watchdog activated")
 			if !r.leaderIsAlive() {
 				log.Print("Leader is unreachable. Stopping delegate.")
 				srv.Shutdown(context.Background())
@@ -400,8 +405,7 @@ func (r *Registry) leaderIsAlive() bool {
 // localTailnetAddr detects and returns the IPv4 address of the local host.
 // Returns an error if the Tailscale status couldn't be queried.
 func localTailnetAddr() (netip.Addr, error) {
-	lc := &tailscale.LocalClient{}
-	s, err := lc.Status(context.Background())
+	s, err := getIpnStatus(context.Background())
 	if err != nil {
 		return netip.Addr{}, err
 	}
@@ -416,8 +420,7 @@ func localTailnetAddr() (netip.Addr, error) {
 // addresses. Returns an error if the Tailscale status couldn't be queried.
 func peerIpv4Addrs() ([]netip.Addr, error) {
 	var addrs []netip.Addr
-	lc := &tailscale.LocalClient{}
-	s, err := lc.Status(context.Background())
+	s, err := getIpnStatus(context.Background())
 	if err != nil {
 		return addrs, err
 	}
@@ -432,8 +435,7 @@ func peerIpv4Addrs() ([]netip.Addr, error) {
 // tailnet, including the own host's.
 func listTailnetAddrs() ([]netip.Addr, error) {
 	var addrs []netip.Addr
-	lc := &tailscale.LocalClient{}
-	s, err := lc.Status(context.Background())
+	s, err := getIpnStatus(context.Background())
 	if err != nil {
 		return addrs, err
 	}
@@ -455,4 +457,15 @@ func chooseIPv4(addrs []netip.Addr) []netip.Addr {
 		}
 	}
 	return r
+}
+
+// Override for testing.
+var ipnStatusForTesting *ipnstate.Status = nil
+
+func getIpnStatus(ctx context.Context) (*ipnstate.Status, error) {
+	if ipnStatusForTesting != nil {
+		return ipnStatusForTesting, nil
+	}
+	lc := &tailscale.LocalClient{}
+	return lc.Status(ctx)
 }
