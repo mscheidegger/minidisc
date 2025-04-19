@@ -11,7 +11,7 @@
 package grpcresolver
 
 import (
-	"github.com/mscheidegger/minidisc/pkg/minidisc"
+	"github.com/mscheidegger/minidisc/go/pkg/minidisc"
 	"google.golang.org/grpc/resolver"
 )
 

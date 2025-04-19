@@ -11,7 +11,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"github.com/mscheidegger/minidisc/pkg/minidisc"
+	"github.com/mscheidegger/minidisc/go/pkg/minidisc"
 	"gopkg.in/yaml.v3"
 )
 
