@@ -1,4 +1,4 @@
-module github.com/mscheidegger/minidisc
+module github.com/mscheidegger/minidisc/go
 
 go 1.23.1
 
