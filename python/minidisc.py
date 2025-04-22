@@ -7,13 +7,14 @@ import ipaddress
 import json
 import logging
 import pydantic
+import pydantic_core
 import socket
 import sys
 import threading
 import time
 import typing
 
-_logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class Error(Exception):
@@ -21,49 +22,79 @@ class Error(Exception):
     pass
 
 
+class Endpoint(str):
+    """address:port-style string, with accessors for address and port."""
+
+    def __new__(cls, value):
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, str):
+            raise TypeError('Endpoint must be a string')
+        obj = str.__new__(cls, value)
+        obj._address, sep, obj._port = value.rpartition(':')
+        if sep != ':':
+            raise ValueError(f"must be in address:port form, got {value!r}")
+        obj._port = int(obj._port)
+        return obj
+
+    @property
+    def address(self) -> str:
+        return self._address
+
+    @property
+    def port(self) -> str:
+        return self._port
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls, source_type: typing.Any, handler: pydantic.GetCoreSchemaHandler
+    ) -> pydantic_core.CoreSchema:
+        """Custom validation, allows the type of be used in Pydantic models."""
+        return pydantic_core.core_schema.no_info_after_validator_function(
+            cls, handler(str))
+
+
 class Service(pydantic.BaseModel):
+    """Metadata of an advertised service."""
     name: str
     labels: dict[str, str]
-    addr_port: tuple[str, int] = pydantic.Field(alias='addrPort')
-
-    # Allow using addr_port when constructing an instance.
+    endpoint: Endpoint = pydantic.Field(alias='addrPort')
+    # Allow using 'endpoint=' when constructing an instance.
     model_config = pydantic.ConfigDict(populate_by_name=True)
-
-    @pydantic.field_validator('addr_port', mode='before')
-    def parse_addr_port(cls, v):
-        if isinstance(v, str):
-            host, port = v.split(':', 1)
-            ipaddress.IPv4Address(host)  # Validate numbers-and-dots format.
-            return host, int(port)
-        return v
-
-    @pydantic.field_serializer('addr_port')
-    def serialize_addr_port(self, v: tuple[str, int]) -> str:
-        return f'{v[0]}:{v[1]}'
 
 
 def list_services() -> list[Service]:
+    """All services on the Tailnet advertised by Minidisc."""
     addrs = _list_tailnet_addresses()
     services = []
     for addr in addrs:
         try:
             part = _get_remote_services(addr, 28004)
             services.extend(part)
-        except (ConnectionRefusedError, TimeoutError):
-            # Hit a node without Minidisc discovery, just continue.
+        except (ConnectionRefusedError, TimeoutError, http.client.HTTPException):
+            # We've hit a host without Minidisc discovery, just continue.
             pass
     return services
 
 
-def find_service(name: str, labels: dict[str, str]) -> tuple[str, int]|None:
+def find_service(name: str, labels: dict[str, str]) -> Endpoint|None:
+    """Finds a matching service and returns where to reach it.
+
+    Args:
+      name: The service name. Must match exactly.
+      labels: Key-value pairs to match with the services' labels. For example,
+          {'foo': 'bar'} will match {'foo': 'bar'} and {'foo': 'bar', 'x': 'y'}
+          but not {'x': 'y'}. {} matches everything.
+    """
     for service in list_services():
         if name == service.name and _labels_match(labels, service.labels):
-            return service.addr_port
+            return service.endpoint
     return None
 
 
 @typing.runtime_checkable
 class Registry(typing.Protocol):
+    """The user-facing functionality of the Minidisc registry."""
 
     def advertise_service(self, port: int, name: str, labels: dict[str, str]):
         """Adds the service to the list advertised by the local node."""
@@ -75,6 +106,7 @@ class Registry(typing.Protocol):
 
 
 def start_registry() -> Registry:
+    """Create a registry and connect it to the Minidisc network."""
     addr = _get_own_tailnet_addresses()
     registry = _RegistryImpl(addr)
     node = _MinidiscNode(addr, registry)
@@ -85,27 +117,30 @@ def start_registry() -> Registry:
 ## Internals ###################################################################
 
 
-_ServiceList = pydantic.TypeAdapter(list[Service])
-
-
 def _labels_match(want: dict[str, str], have: dict[str, str]) -> bool:
+    """Implements the label matching of find_service()."""
     for k, v in want.items():
         if have.get(k) != v:
             return False
     return True
 
 
-def _get_remote_services(addr: str, port: int) -> list[Service]:
-    conn = http.client.HTTPConnection(addr, port, timeout=2)
-    conn.request('GET', '/services')
-    response = conn.getresponse()
-    if response.status != 200:
-        raise Error(
-            'Error fetching minidisc services, '
-            f'status {response.status}, reason "{response.reason}"')
-    body = response.read().decode('utf-8')
-    data = json.loads(body)
-    return _ServiceList.validate_python(data)
+def _get_remote_services(addr: str, port: int, timeout=2) -> list[Service]:
+    """Fetches the service list from a remote Minidisc registry."""
+    body = _http_get(addr, port, '/services', timeout=timeout)
+    json_data = json.loads(body.decode('utf-8'))
+    adapter = pydantic.TypeAdapter(list[Service])
+    return adapter.validate_python(json_data)
+
+
+def _http_get(addr: str, port: int, path: str, timeout=None) -> bytes:
+    conn = http.client.HTTPConnection(addr, port, timeout=timeout)
+    conn.request('GET', path)
+    resp = conn.getresponse()
+    if 200 <= resp.status < 300:
+        return resp.read()
+    raise http.client.HTTPException(
+        f'GET {path} failed. Status: {resp.status}, reason: {resp.reason}')
 
 
 class _RegistryImpl(Registry):
@@ -120,10 +155,10 @@ class _RegistryImpl(Registry):
         new_entry = Service(
             name=name,
             labels=labels,
-            addr_port=f'{self._addr}:{port}')
+            endpoint=f'{self._addr}:{port}')
         with self._mutex:
             for i, service in enumerate(self._services):
-                if service.addr_port[1] == port:
+                if service.endpoint.port == port:
                     self._services[i] = new_entry
                     break
             else:
@@ -132,7 +167,7 @@ class _RegistryImpl(Registry):
     def unlist_service(self, port: int):
         with self._mutex:
             for i, service in enumerate(self._services):
-                if service.addr_port[1] == port:
+                if service.endpoint.port == port:
                     self._services.pop(i)
                     return
         raise KeyError(f'No service with port {port}')
@@ -155,10 +190,10 @@ class _MinidiscNode:
         while True:
             server = self._bind_server()
             if server.server_port == 28004:
-                _logger.info('Starting in leader mode')
+                logger.info('Starting in leader mode')
                 server.serve_forever()
             else:
-                _logger.info('Starting in delegate mode')
+                logger.info('Starting in delegate mode')
                 self._run_as_delegate(server)
 
     def _bind_server(self) -> http.server.HTTPServer:
@@ -171,7 +206,7 @@ class _MinidiscNode:
             try:
                 return http.server.HTTPServer((self._addr, port), handler)
             except OSError as e:
-                _logger.info('Failed to start on port %d: %s', port ,e)
+                logger.info('Failed to start on port %d: %s', port ,e)
         raise AssertionError('Cannot bind Minidisc server, giving up!')
 
     def _run_as_delegate(self, server: http.server.HTTPServer):
@@ -179,30 +214,28 @@ class _MinidiscNode:
         srv_thread.start()
         try:
             _add_delegate(self._addr, server.server_port)
-            _logger.info('Registered as delegate')
+            logger.info('Registered as delegate')
         except OSError as e:
-            _logger.error('Cannot register as delegate: %s', e)
+            logger.error('Cannot register as delegate: %s', e)
             server.shutdown()
             srv_thread.join()
             time.sleep(10)
             return
         while self._leader_is_alive():
             time.sleep(5)
-        _logger.info('Leader went away, restarting minidisc server')
+        logger.info('Leader went away, restarting minidisc server')
         server.shutdown()
         srv_thread.join()
 
     def _leader_is_alive(self) -> bool:
         try:
-            conn = http.client.HTTPConnection(self._addr, 28004, timeout=2)
-            conn.request('GET', '/ping')
-            response = conn.getresponse()
-            return response.status == 200
-        except OSError:
+            _http_get(self._addr, 28004, '/ping', timeout=.5)
+        except (OSError, TimeoutError):
             return False
+        return True
 
     def _handle_http_get(self, handler: http.server.BaseHTTPRequestHandler):
-        _logger.info('GET %s', handler.path)
+        logger.info('GET %s', handler.path)
         if handler.path == '/ping':
             handler.send_response(200)
             handler.end_headers()
@@ -298,17 +331,3 @@ def _read_ipn_status():
     body = resp.read().decode('utf-8')
     data = json.loads(body)
     return data
-
-
-if __name__ == '__main__':
-    logging.basicConfig(
-        stream=sys.stderr,
-        level=logging.INFO)
-    registry = start_registry()
-    registry.advertise_service(42, 'fuedle', {})
-    input('>')
-    #print(list_services())
-    #print(find_service('Greeter', {}))
-    #own_ip = ipaddress.IPv4Address('100.69.73.82')
-    #print(_get_remote_services(own_ip, 28004))
-    #print(_list_tailnet_addresses())
