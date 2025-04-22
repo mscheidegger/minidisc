@@ -372,8 +372,10 @@ func (r *Registry) runDelegateNode(listener net.Listener) {
 	url := fmt.Sprintf("http://%s/add-delegate", mainAddr)
 	mime := "application/json"
 	resp, err := http.Post(url, mime, bytes.NewReader(data))
-	if err != nil || resp.StatusCode != 200 {
-		log.Fatalf("Cannot register with leader. Status %d, error %v", resp.StatusCode, err)
+	if err != nil {
+		log.Fatalf("Cannot register with leader: %v", err)
+	} else if resp.StatusCode != 200 {
+		log.Fatalf("Cannot register with leader: status %d", resp.StatusCode)
 	}
 
 	// Serve, but regularly check whether the leader has died.
