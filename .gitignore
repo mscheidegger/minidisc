@@ -26,3 +26,11 @@ go.work.sum
 
 # Emacs tempfiles
 *~
+
+# Python
+dist/
+build/
+.venv/
+__pycache__/
+*.egg-info/
+*.py[cod]

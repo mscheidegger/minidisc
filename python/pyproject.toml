@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools >= 77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minidisc-python"
+version = "0.0.1"
+description = "Minidisc Python library"
+readme = "README.md"
+requires-python = ">=3.7"
+authors = [
+  { name="Matthias Scheidegger", email="mscheidegger@gmail.com" }
+]
+dependencies = [
+  "pydantic>=2",
+]
+
+[project.urls]
+Homepage = "https://github.com/mscheidegger/minidisc"
+Repository = "https://github.com/mscheidegger/minidisc.git"
