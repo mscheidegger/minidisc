@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "minidisc-python"
-version = "0.0.2"
+version = "0.0.4"
 description = "Minidisc Python library"
 readme = "README.md"
 requires-python = ">=3.7"
@@ -12,7 +12,7 @@ authors = [
   { name="Matthias Scheidegger", email="mscheidegger@gmail.com" }
 ]
 dependencies = [
-  "pydantic>=2",
+  "pydantic>=2.0,<3",
 ]
 
 [project.urls]
