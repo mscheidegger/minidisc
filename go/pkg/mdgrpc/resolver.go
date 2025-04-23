@@ -8,7 +8,7 @@
 // To use, just call mdgrpc.RegisterResolver() before creating any gRPC client
 // connections.
 
-package grpcresolver
+package mdgrpc
 
 import (
 	"github.com/mscheidegger/minidisc/go/pkg/minidisc"
