@@ -17,8 +17,8 @@ import typing
 logger = logging.getLogger(__name__)
 
 
-class Error(Exception):
-    """Minidisc specific error."""
+class TailscaleError(OSError):
+    """Error while communicating with Tailscale."""
     pass
 
 
@@ -64,21 +64,23 @@ class Service(pydantic.BaseModel):
 
 
 def list_services() -> list[Service]:
-    """All services on the Tailnet advertised by Minidisc."""
+    """List all services on the local Tailnet advertised by Minidisc."""
     addrs = _list_tailnet_addresses()
     services = []
     for addr in addrs:
         try:
             part = _get_remote_services(addr, 28004)
+            logger.info('XXX %s: %s', addr, part)
             services.extend(part)
-        except (ConnectionRefusedError, TimeoutError, http.client.HTTPException):
+        except (ConnectionRefusedError, TimeoutError, http.client.HTTPException) as e:
+            logger.info('YYY %s: %s', addr, e)
             # We've hit a host without Minidisc discovery, just continue.
             pass
     return services
 
 
 def find_service(name: str, labels: dict[str, str]) -> Endpoint|None:
-    """Finds a matching service and returns where to reach it.
+    """Finds a matching service on the Tailnet and returns where to reach it.
 
     Args:
       name: The service name. Must match exactly.
@@ -97,11 +99,11 @@ class Registry(typing.Protocol):
     """The user-facing functionality of the Minidisc registry."""
 
     def advertise_service(self, port: int, name: str, labels: dict[str, str]):
-        """Adds the service to the list advertised by the local node."""
+        """Adds the service to the list advertised to the Tailnet."""
         ...
 
     def unlist_service(self, port: int):
-        """Removes the service from  the list advertised by the local node."""
+        """Removes the service from  the advertised list."""
         ...
 
 
@@ -110,7 +112,9 @@ def start_registry() -> Registry:
     addr = _get_own_tailnet_addresses()
     registry = _RegistryImpl(addr)
     node = _MinidiscNode(addr, registry)
-    threading.Thread(target=node.run, daemon=True).start()
+    ready = threading.Event()
+    threading.Thread(target=node.run, args=(ready,), daemon=True).start()
+    ready.wait()
     return registry
 
 
@@ -134,6 +138,7 @@ def _get_remote_services(addr: str, port: int, timeout=2) -> list[Service]:
 
 
 def _http_get(addr: str, port: int, path: str, timeout=None) -> bytes:
+    """GETs http://addr:port/path and returns the response body."""
     conn = http.client.HTTPConnection(addr, port, timeout=timeout)
     conn.request('GET', path)
     resp = conn.getresponse()
@@ -144,6 +149,7 @@ def _http_get(addr: str, port: int, path: str, timeout=None) -> bytes:
 
 
 class _RegistryImpl(Registry):
+    """Internal implementaion of the Registry protocol."""
 
     def __init__(self, addr: str):
         self._addr = addr
@@ -179,6 +185,13 @@ class _RegistryImpl(Registry):
 
 
 class _MinidiscNode:
+    """A node of the minidisc peer-to-peer network.
+
+    This class implements the logic of advertising the Registry's services to
+    the Tailnet. It's invisible to the user, who only deals with the Registry
+    and toplevel functions like list_services(), but provides separation of
+    concerns and makes the code easier to understand.
+    """
 
     def __init__(self, addr: str, registry: _RegistryImpl):
         self._addr = addr
@@ -186,17 +199,26 @@ class _MinidiscNode:
         self._delegates: list[tuple[str, int]] = []
         self._mutex = threading.Lock()
 
-    def run(self):
+    def run(self, ready: threading.Event):
+        """Run the serving loop of the node.
+
+        Args:
+          ready: Threading Event, which will be set once the server is up and
+              can be used. After this point, HTTP requests to the server will
+              succeed.
+        """
         while True:
             server = self._bind_server()
             if server.server_port == 28004:
                 logger.info('Starting in leader mode')
+                ready.set()
                 server.serve_forever()
             else:
                 logger.info('Starting in delegate mode')
-                self._run_as_delegate(server)
+                self._run_as_delegate(server, ready)
 
     def _bind_server(self) -> http.server.HTTPServer:
+        """Bind the server as leader if possible, otherwise as delegate."""
         # Dynamically create a handler class.
         handler = type('Handler', (http.server.BaseHTTPRequestHandler,), {
             'do_GET': lambda handler: self._handle_http_get(handler),
@@ -209,18 +231,27 @@ class _MinidiscNode:
                 logger.info('Failed to start on port %d: %s', port ,e)
         raise AssertionError('Cannot bind Minidisc server, giving up!')
 
-    def _run_as_delegate(self, server: http.server.HTTPServer):
-        srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
-        srv_thread.start()
+    def _run_as_delegate(
+            self, server: http.server.HTTPServer, ready: threading.Event,
+    ):
+        """Run the minidisc node in delegate mode.
+
+        Next to running the webserver as in leader mode, this involves
+        registering as delegate with the local leader, then regularly checking
+        whether that leader is still alive. If it goes away, this node exits
+        delegate mode and tries to restart as leader.
+        """
         try:
-            _add_delegate(self._addr, server.server_port)
+            _add_delegate_to_local_leader(self._addr, server.server_port)
             logger.info('Registered as delegate')
         except OSError as e:
             logger.error('Cannot register as delegate: %s', e)
             server.shutdown()
-            srv_thread.join()
             time.sleep(10)
             return
+        ready.set()
+        srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        srv_thread.start()
         while self._leader_is_alive():
             time.sleep(5)
         logger.info('Leader went away, restarting minidisc server')
@@ -228,6 +259,7 @@ class _MinidiscNode:
         srv_thread.join()
 
     def _leader_is_alive(self) -> bool:
+        """Check and return whether the local Minidisc leader is alive."""
         try:
             _http_get(self._addr, 28004, '/ping', timeout=.5)
         except (OSError, TimeoutError):
@@ -235,7 +267,7 @@ class _MinidiscNode:
         return True
 
     def _handle_http_get(self, handler: http.server.BaseHTTPRequestHandler):
-        logger.info('GET %s', handler.path)
+        """Handle an HTTP GET request to the Minidisc port."""
         if handler.path == '/ping':
             handler.send_response(200)
             handler.end_headers()
@@ -260,6 +292,7 @@ class _MinidiscNode:
             handler.send_error(404, 'Path not found')
 
     def _handle_http_post(self, handler: http.server.BaseHTTPRequestHandler):
+        """Handle an HTTP POST request to the Minidisc port."""
         if handler.path != '/add-delegate':
             handler.send_error(404, 'Path not found')
             return
@@ -279,7 +312,19 @@ class _MinidiscNode:
         handler.end_headers()
 
 
-def _add_delegate(addr: str, port: int):
+def _add_delegate_to_local_leader(addr: str, port: int):
+    """Register our own minidisc node with the local leader node.
+
+    This gets called when during starting a Minidisc registry and we detect that
+    the current process isn't the first one to do so on this IP address. In that
+    case, this process' registry binds to an arbitrary port and registers as a
+    delegate with the process that grabbed the main port (28004).
+
+    Args:
+      addr: The Tailnet IPv4 address of the local host.
+      port: The port our own delegate is running on.
+
+    """
     assert port != 28004
     conn = http.client.HTTPConnection(addr, 28004)
     body = json.dumps({'addrPort': f'{addr}:{port}'})
@@ -292,6 +337,7 @@ def _add_delegate(addr: str, port: int):
 
 
 def _list_tailnet_addresses() -> list[str]:
+    """Return all IPv4 addresses on the Tailnet as numbers-and-dots."""
     ipn_status = _read_ipn_status()
     all_addrs = []
     all_addrs.extend(ipn_status['TailscaleIPs'])
@@ -309,6 +355,7 @@ def _list_tailnet_addresses() -> list[str]:
 
 
 def _get_own_tailnet_addresses() -> str:
+    """Return the local host's IPv4 Tailnet address as numbers-and-dots."""
     ipn_status = _read_ipn_status()
     for ip in ipn_status['TailscaleIPs']:
         try:
@@ -316,18 +363,32 @@ def _get_own_tailnet_addresses() -> str:
             return ip
         except ipaddress.AddressValueError:
             pass  # Ignore IPv6 addresses
-    raise LookupError('No local IPv4 Tailscale address found')
+    raise TailscaleError('No local IPv4 Tailscale address found')
 
 
 def _read_ipn_status():
-    conn = http.client.HTTPConnection('local-tailscaled.sock', 80)
-    conn.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    conn.sock.connect('/var/run/tailscale/tailscaled.sock')
-    conn.request('GET', '/localapi/v0/status')
-    resp = conn.getresponse()
+    """Read, parse, and return the Tailscale status JSON from the local socket.
+
+    This is reaching into the internals of Tailscale, but is using a key
+    interface that shouldn't change much across versions. The only viable
+    alternative would be to shell out to the 'tailscale' binary, which would
+    likely cause more user-visible flakiness than this hack.
+    """
+    try:
+        # Emulate the trick that Tailscale uses internally: Talk HTTP over a
+        # UNIX domain socket. Setting the hostname should result in the correct
+        # Host: being set in the requests.
+        conn = http.client.HTTPConnection('local-tailscaled.sock', 80)
+        conn.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn.sock.connect('/var/run/tailscale/tailscaled.sock')
+        conn.request('GET', '/localapi/v0/status')
+        resp = conn.getresponse()
+    except OSError as e:
+        raise TailscaleError('Unable to talk to Tailscale socket') from e
     if resp.status != 200:
-        raise Error(
-            f'Fetching Tailnet status {resp.status}, reason "{resp.reason}"')
+        raise TailscaleError(
+            'Error getting status from Tailscale socket. '
+            f'Status: {resp.status}, reason: "{resp.reason}"')
     body = resp.read().decode('utf-8')
     data = json.loads(body)
     return data
