@@ -31,7 +31,7 @@ import grpc
 import minidisc
 
 endpoint = minidisc.find_service('myservice', {'env': 'prod'})
-channel = grpc.insecure_channel(logsaver_endpoint)
+channel = grpc.insecure_channel(endpoint)
 # ... now use the channel to create gRPC stubs.
 ```
 
