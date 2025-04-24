@@ -7,6 +7,8 @@
 //
 // To use, just call mdgrpc.RegisterResolver() before creating any gRPC client
 // connections.
+//
+// This is experimental, as is the gRPC resolver API it uses.
 
 package mdgrpc
 
