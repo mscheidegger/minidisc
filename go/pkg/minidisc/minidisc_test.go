@@ -18,14 +18,14 @@ import (
 	"testing"
 	"time"
 
-	"tailscale.com/ipn/ipnstate"
-	"tailscale.com/types/key"
+	//"tailscale.com/ipn/ipnstate"
+	//"tailscale.com/types/key"
 )
 
 var (
-	ipnStatus   *ipnstate.Status   = nil
-	testServers []*httptest.Server = nil
-	registry    *Registry          = nil
+	fakeTailnetMap *tailnetMap        = nil
+	testServers    []*httptest.Server = nil
+	registry       *Registry          = nil
 )
 
 func TestMain(m *testing.M) {
@@ -36,16 +36,15 @@ func TestMain(m *testing.M) {
 }
 
 func setupEnv() {
-	ipnStatus = &ipnstate.Status{Peer: make(map[key.NodePublic]*ipnstate.PeerStatus)}
-	ipnStatusForTesting = ipnStatus
+	fakeTailnetMap = &tailnetMap{}
+	tailnetMapForTesting = fakeTailnetMap
 	setupRegistry()
 	setupDelegate()
 	setupPeers()
 }
 
 func setupRegistry() {
-	addr := netip.MustParseAddr("127.0.0.2")
-	ipnStatus.TailscaleIPs = append(ipnStatus.TailscaleIPs, addr)
+	fakeTailnetMap.LocalAddr = netip.MustParseAddr("127.0.0.2")
 	var err error
 	registry, err = StartRegistry()
 	if err != nil {
@@ -81,10 +80,7 @@ func setupPeers() {
 	var servers []*httptest.Server
 	for _, p := range peers {
 		parsedAddr := netip.MustParseAddr(p.addr)
-		ipnStatus.Peer[key.NewNode().Public()] = &ipnstate.PeerStatus{
-			Online:       true,
-			TailscaleIPs: []netip.Addr{parsedAddr},
-		}
+		fakeTailnetMap.PeerAddrs = append(fakeTailnetMap.PeerAddrs, parsedAddr)
 		ln, err := net.Listen("tcp", p.addr+":28004")
 		if err != nil {
 			log.Fatal(err)

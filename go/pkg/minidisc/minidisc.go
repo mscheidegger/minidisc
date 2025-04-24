@@ -1,6 +1,4 @@
 // Minidisc service discovery.
-//
-// TODO: What happens if I change tailnet?
 
 package minidisc
 
@@ -18,9 +16,6 @@ import (
 	"slices"
 	"sync"
 	"time"
-
-	"tailscale.com/client/tailscale"
-	"tailscale.com/ipn/ipnstate"
 )
 
 // Service represents a network service on the Tailnet.
@@ -137,12 +132,12 @@ type Registry struct {
 // StartRegistry creates a local Minidisc registry and starts the goroutines
 // that keep it up-to-date and connected to other registries on the Tailnet.
 func StartRegistry() (*Registry, error) {
-	localAddr, err := localTailnetAddr()
+	tmap, err := getTailnetMap()
 	if err != nil {
 		return nil, err
 	}
 	r := &Registry{
-		localAddr:     localAddr,
+		localAddr:     tmap.LocalAddr,
 		localServices: []Service{}, // Empty list, but JSON marshal-able.
 	}
 	go r.connect()
@@ -404,70 +399,104 @@ func (r *Registry) leaderIsAlive() bool {
 
 // Tailscale status detection //////////////////////////////////////////////////
 
-// localTailnetAddr detects and returns the IPv4 address of the local host.
-// Returns an error if the Tailscale status couldn't be queried.
-func localTailnetAddr() (netip.Addr, error) {
-	s, err := getIpnStatus(context.Background())
-	if err != nil {
-		return netip.Addr{}, err
-	}
-	addrs := chooseIPv4(s.TailscaleIPs)
-	if len(addrs) == 0 {
-		return netip.Addr{}, fmt.Errorf("No local Tailscale IPv4 address found")
-	}
-	return addrs[0], nil
-}
-
-// peerIpv4Addrs detects the current peers on the Tailnet and returns their IPv4
-// addresses. Returns an error if the Tailscale status couldn't be queried.
-func peerIpv4Addrs() ([]netip.Addr, error) {
-	var addrs []netip.Addr
-	s, err := getIpnStatus(context.Background())
-	if err != nil {
-		return addrs, err
-	}
-	for _, peer := range s.Peer {
-		addrs = slices.Concat(addrs, peer.TailscaleIPs)
-	}
-	addrs = chooseIPv4(addrs)
-	return addrs, nil
+type tailnetMap struct {
+	LocalAddr netip.Addr
+	PeerAddrs []netip.Addr
 }
 
 // listTailnetAddrs detects and returns all live IPv4 addresses on the current
 // tailnet, including the own host's.
 func listTailnetAddrs() ([]netip.Addr, error) {
-	var addrs []netip.Addr
-	s, err := getIpnStatus(context.Background())
+	tmap, err := getTailnetMap()
 	if err != nil {
-		return addrs, err
+		return nil, err
 	}
-	addrs = s.TailscaleIPs
-	for _, peer := range s.Peer {
-		if peer.Online {
-			addrs = slices.Concat(addrs, peer.TailscaleIPs)
-		}
-	}
-	addrs = chooseIPv4(addrs)
+	addrs := make([]netip.Addr, 0, 1+len(tmap.PeerAddrs))
+	addrs = append(addrs, tmap.LocalAddr)
+	addrs = append(addrs, tmap.PeerAddrs...)
 	return addrs, nil
 }
 
-func chooseIPv4(addrs []netip.Addr) []netip.Addr {
-	var r []netip.Addr
-	for _, addr := range addrs {
-		if addr.Is4() {
-			r = append(r, addr)
+// Override for testing.
+var tailnetMapForTesting *tailnetMap = nil
+
+// getTailnetMap reads the Tailnet status from Tailscale's unix domain socket,
+// parses it and returns a map of currently-online IPv4 address on the Tailnet.
+//
+// Why not just use Tailscale's own library for this, I hear you ask. Indeed,
+// the first version of this code did use that library (namely the ipnstate.Status
+// struct and related code) but it's not a stable interface and varies between
+// versions of the Tailscale code. We could pin the Tailscale dependency to a
+// particular version, but that wouldn't play well with clients who depend on
+// that library for other reasons. In contrast, this internal socket interface
+// is much more stable across versions, and we can even do away with the
+// dependency on the Tailscale code.
+func getTailnetMap() (tailnetMap, error) {
+	if tailnetMapForTesting != nil {
+		return *tailnetMapForTesting, nil
+	}
+	tmap := tailnetMap{}
+
+	// Fake Tailscale's HTTP-over-UDS communication with tailscaled.
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return net.Dial("unix", "/var/run/tailscale/tailscaled.sock")
+		},
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   500 * time.Millisecond,
+	}
+	req, err := http.NewRequest("GET", "http://local-tailscaled.sock/localapi/v0/status", nil)
+	if err != nil {
+		log.Fatalf("Error constructing http.Request: %v", err)
+	}
+	req.Host = "local-tailscaled.sock"
+
+	// Send the request.
+	resp, err := client.Do(req)
+	if err != nil {
+		return tmap, fmt.Errorf("Error reading tailnet status: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return tmap, fmt.Errorf("%s while reading tailnet status", resp.Status)
+	}
+
+	// Decode the response.
+	var status struct {
+		TailscaleIPs []netip.Addr `json:"TailscaleIPs"`
+		Peer         map[string]struct {
+			Online       bool         `json:"Online"`
+			TailscaleIPs []netip.Addr `json:"TailscaleIPs"`
+		} `json:"Peer"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		return tmap, fmt.Errorf("Cannot decode tailnet status: %v", err)
+	}
+	if addr, ok := findIPv4Addr(status.TailscaleIPs); ok {
+		tmap.LocalAddr = addr
+	} else {
+		return tmap, fmt.Errorf("Cannot find IPv4 Tailscale address for local host")
+	}
+	for _, peer := range status.Peer {
+		if !peer.Online {
+			continue
+		}
+		if addr, ok := findIPv4Addr(peer.TailscaleIPs); ok {
+			tmap.PeerAddrs = append(tmap.PeerAddrs, addr)
 		}
 	}
-	return r
+	return tmap, nil
 }
 
-// Override for testing.
-var ipnStatusForTesting *ipnstate.Status = nil
-
-func getIpnStatus(ctx context.Context) (*ipnstate.Status, error) {
-	if ipnStatusForTesting != nil {
-		return ipnStatusForTesting, nil
+// findIPv4Addr returns the first IPv4 address in the list, or the uninitialised
+// address. The bool is true in the former case.
+func findIPv4Addr(addrs []netip.Addr) (netip.Addr, bool) {
+	for _, addr := range addrs {
+		if addr.Is4() {
+			return addr, true
+		}
 	}
-	lc := &tailscale.LocalClient{}
-	return lc.Status(ctx)
+	return netip.Addr{}, false
 }
