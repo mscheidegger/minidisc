@@ -35,6 +35,7 @@ type Service struct {
 }
 
 func main() {
+	minidisc.SetLogger(minidisc.LevelLogger{Level: 2})
 	if len(os.Args) < 2 {
 		help()
 		os.Exit(2)
