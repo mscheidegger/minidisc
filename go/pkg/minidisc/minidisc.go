@@ -47,7 +47,9 @@ func ListServices() ([]Service, error) {
 			if services, err := getRemoteServices(ap); err == nil {
 				ch <- services
 			} else if !isUrlError(err) {
-				log.Printf("Error for %s: %v", ap.String(), err)
+				logger.Warnf("Error fetching services from %s: %v", ap.String(), err)
+			} else {
+				logger.Debugf("Error connecting to %s: %v", ap.String(), err)
 			}
 		}()
 	}
@@ -140,6 +142,7 @@ func StartRegistry() (*Registry, error) {
 		localAddr:     tmap.LocalAddr,
 		localServices: []Service{}, // Empty list, but JSON marshal-able.
 	}
+	logger.Infof("Starting Minidisc registry")
 	go r.connect()
 	return r, nil
 }
@@ -183,6 +186,10 @@ func (r *Registry) addService(
 		Labels:   labels,
 		AddrPort: addrPort,
 	})
+	logger.Infof(
+		"Advertising new service. Name: %s, labels: %v, address: %s",
+		name, labels, addrPort.String(),
+	)
 	return nil
 }
 
@@ -200,7 +207,7 @@ func (r *Registry) UnlistService(port uint16) error {
 	return nil
 }
 
-// Registry HTTP API ///////////////////////////////////////////////////////////
+// Registry HTTP handlers //////////////////////////////////////////////////////
 
 // ServeHTTP provides the HTTP handlers that other Minidisc registries talk to.
 func (r *Registry) ServeHTTP(wrt http.ResponseWriter, req *http.Request) {
@@ -245,7 +252,7 @@ func (r *Registry) handleGetServices(wrt http.ResponseWriter, req *http.Request)
 		wrt.WriteHeader(http.StatusOK)
 		wrt.Write(data)
 	} else {
-		log.Printf("Error generating JSON: %v", err)
+		logger.Errorf("Error generating JSON: %v", err)
 		wrt.WriteHeader(http.StatusInternalServerError)
 	}
 }
@@ -262,23 +269,23 @@ func (r *Registry) handlePostAddDelegate(wrt http.ResponseWriter, req *http.Requ
 	}
 	body, err := io.ReadAll(req.Body)
 	if err != nil {
-		log.Printf("Error reading POST body: %v", err)
+		logger.Warnf("Error reading POST body: %v", err)
 		wrt.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 	adr := &addDelegateRequest{}
 	if err := json.Unmarshal(body, adr); err != nil {
-		log.Printf("Malformed request: %v", err)
+		logger.Warnf("Malformed request: %v", err)
 		wrt.WriteHeader(http.StatusBadRequest)
 	}
 	if adr.AddrPort.Addr() != r.localAddr {
-		log.Printf("add-delegate request for non-local address %s\n", adr.AddrPort.String())
+		logger.Warnf("add-delegate request for non-local address %s\n", adr.AddrPort.String())
 		wrt.WriteHeader(http.StatusForbidden)
 		return
 	}
 	wrt.WriteHeader(http.StatusOK)
 
-	log.Printf("Adding delegate at %s", adr.AddrPort)
+	logger.Infof("Adding delegate at %s", adr.AddrPort)
 	r.addDelegate(adr.AddrPort)
 }
 
@@ -329,18 +336,21 @@ func (r *Registry) connect() {
 		if listener, err := net.Listen("tcp4", mainAddr); err == nil {
 			r.runLeaderNode(listener)
 		} else if listener, err := net.Listen("tcp4", delegateAddr); err == nil {
-			r.runDelegateNode(listener)
+			if err := r.runDelegateNode(listener); err != nil {
+				logger.Infof("Waiting 10s before restarting registry")
+				time.Sleep(10 * time.Second)
+			}
 		} else {
-			log.Fatal("Cannot bind to any port")
+			log.Fatalf("Couldn't bind to any port: %v", err)
 		}
 	}
 }
 
 // runLeaderNode runs the HTTP server in "leader" mode.
 func (r *Registry) runLeaderNode(listener net.Listener) {
-	log.Print("Starting minidisc leader")
+	logger.Infof("Minidisc registry started as leader")
 	err := http.Serve(listener, r)
-	log.Printf("minidisc leader server exited: %v", err)
+	logger.Infof("Minidisc leader exited: %v", err)
 }
 
 // runDelegateNode runs the HTTP server in "delegate" mode. Because we're not
@@ -348,8 +358,8 @@ func (r *Registry) runLeaderNode(listener net.Listener) {
 // as a delegate. Additionally, we run liveness checks (/ping) every few seconds
 // to detect if the leader goes away. When that happens, we shut down the
 // delegate server and try to restart it as the leader.
-func (r *Registry) runDelegateNode(listener net.Listener) {
-	log.Print("Starting minidisc delegate")
+func (r *Registry) runDelegateNode(listener net.Listener) error {
+	logger.Infof("Minidisc registry started as leader")
 	srv := &http.Server{Handler: r}
 	exit := make(chan error)
 	go func() {
@@ -368,20 +378,25 @@ func (r *Registry) runDelegateNode(listener net.Listener) {
 	mime := "application/json"
 	resp, err := http.Post(url, mime, bytes.NewReader(data))
 	if err != nil {
-		log.Fatalf("Cannot register with leader: %v", err)
+		return fmt.Errorf("Cannot contact leader: %v", err)
 	} else if resp.StatusCode != 200 {
-		log.Fatalf("Cannot register with leader: status %d", resp.StatusCode)
+		return fmt.Errorf("Error registering with leader: %s", resp.Status)
 	}
 
 	// Serve, but regularly check whether the leader has died.
 	for {
 		select {
 		case err := <-exit:
-			log.Printf("minidisc delegate server exited: %v", err)
-			return
+			if err == http.ErrServerClosed {
+				logger.Infof("Minidisc delegate exited")
+				return nil
+			} else {
+				logger.Warnf("Minidisc delegate exited with error: %v", err)
+				return err
+			}
 		case <-time.After(5 * time.Second):
 			if !r.leaderIsAlive() {
-				log.Print("Leader is unreachable. Stopping delegate.")
+				logger.Infof("Leader is unreachable. Stopping delegate.")
 				srv.Shutdown(context.Background())
 			}
 		}

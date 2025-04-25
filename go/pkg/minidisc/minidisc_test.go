@@ -1,8 +1,6 @@
 package minidisc
 
 import (
-	//"bytes"
-	//"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -17,9 +15,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	//"tailscale.com/ipn/ipnstate"
-	//"tailscale.com/types/key"
 )
 
 var (
@@ -28,7 +23,20 @@ var (
 	registry       *Registry          = nil
 )
 
+type testLogger struct{}
+
+func (testLogger) Debugf(format string, args ...any) { logLevel("DEBUG", format, args...) }
+func (testLogger) Infof(format string, args ...any)  { logLevel("INFO", format, args...) }
+func (testLogger) Warnf(format string, args ...any)  { logLevel("WARN", format, args...) }
+func (testLogger) Errorf(format string, args ...any) { logLevel("ERROR", format, args...) }
+
+func logLevel(level, format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	log.Printf("%s: %s", level, msg)
+}
+
 func TestMain(m *testing.M) {
+	SetLogger(testLogger{})
 	setupEnv()
 	code := m.Run()
 	cleanup()
