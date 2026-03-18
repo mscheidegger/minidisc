@@ -1,3 +1,9 @@
+> [!NOTE]
+> Since this project was created, Tailscale has released
+> [Tailscale Services](https://tailscale.com/docs/features/tailscale-services),
+> which provide native service discovery with more features than Minidisc.
+> You should probably use that instead.
+
 # Minidisc
 Zero-config service discovery for Tailscale networks
 
